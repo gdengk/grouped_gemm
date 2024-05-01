@@ -8,10 +8,12 @@ from sys import stderr
 class GroupedGemm(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, a, b, batch_sizes, trans_b):
+    def forward(ctx, a, b, batch_sizes, trans_b, moe_defer_wgemm_all2all, deferdata):
         assert torch.count_nonzero(batch_sizes) != 0, "Input batch_sizes should not be all zeros!"
         ctx.save_for_backward(a, b, batch_sizes)
         ctx.trans_b = trans_b
+        ctx.moe_defer_wgemm_all2all = moe_defer_wgemm_all2all
+        ctx.deferdata = deferdata
         return backend.gmm(a, b, batch_sizes, trans_a=False, trans_b=trans_b)
 
     @staticmethod
@@ -26,15 +28,19 @@ class GroupedGemm(torch.autograd.Function):
                 grad, b, batch_sizes, trans_a=False, trans_b=not trans_b)
 
         bgrad = None
-        if ctx.needs_input_grad[1]:
+        if ctx.needs_input_grad[1] and not ctx.moe_defer_wgemm_all2all:
             lhs, rhs = (grad, a) if trans_b else (a, grad)
             bgrad = backend.gmm(
                 lhs, rhs, batch_sizes, trans_a=True, trans_b=False)
-        return agrad, bgrad, None, None
+        elif ctx.needs_input_grad[1]:
+          lhs, rhs = (grad, a) if trans_b else (a, grad)
+          ctx.deferdata.append((lhs, rhs, batch_sizes))
+
+        return agrad, bgrad, None, None, None, None, None
 
 
-def gmm(a, b, batch_sizes, trans_b=False):
-    return GroupedGemm.apply(a, b, batch_sizes, trans_b)
+def gmm(a, b, batch_sizes, trans_b=False, moe_defer_wgemm_all2all=False, deferdata=None):
+    return GroupedGemm.apply(a, b, batch_sizes, trans_b, moe_defer_wgemm_all2all, deferdata)
 
 def sinkhorn_kernel(cost, tol=0.0001):
     return backend.sinkhorn(cost, tol)
